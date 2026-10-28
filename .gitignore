@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+.vscode/
+.idea/
+
+flow_checkpoints/
+checkpoints/
+run/
+runs/
+*.pth
+*.pkl
+*.pt
