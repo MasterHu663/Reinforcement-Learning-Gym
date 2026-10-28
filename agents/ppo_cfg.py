@@ -7,7 +7,7 @@ import datetime
 
 class ExperimentConfig:
     def __init__(self):
-        self.experiment_name: str = "NC"
+        self.experiment_name: str = "PPO"
         self.write_interval: str | int = "auto"
         self.checkpoint_interval: str | int = "auto"
         self.directory: str = "runs/torch/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

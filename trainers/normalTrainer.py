@@ -18,20 +18,15 @@ class normalTrainer:
         self.device = torch.device(device)
         self.num_envs = env.num_envs
         self.cfg = cfg
-        
-        # init agents
-        for agent in self.agents:
-            agent.init(trainer_cfg=self.cfg)
-        # if self.num_simultaneous_agents > 1:
-        #     for agent in self.agents:
-        #         agent.init(trainer_cfg=self.cfg)
-        # else:
-        #     self.agents.init(trainer_cfg=self.cfg)
 
     def train(self) -> None:
+
+        trainer_cfg = dict(self.cfg)
+        trainer_cfg["mode"] = "train"
         
         # set running mode
         for agent in self.agents:
+            agent.init(trainer_cfg=trainer_cfg)
             agent.enable_training_mode(True)
         unwrapped_env = getattr(self.env, "unwrapped", self.env)
         if hasattr(unwrapped_env, "configure_rendering"):
@@ -117,11 +112,15 @@ class normalTrainer:
         if num_eval_episodes < 1:
             raise ValueError("num_eval_episodes must be positive")
 
-        logger.info("Starting evaluation...")
-        
+        trainer_cfg = dict(self.cfg)
+        trainer_cfg["mode"] = "eval"
+
+        # set running mode
         for agent in self.agents:
+            agent.init(trainer_cfg=trainer_cfg)
             agent.enable_training_mode(False)
 
+        logger.info("Starting evaluation...")
         unwrapped_env = getattr(self.env, "unwrapped", self.env)
         if hasattr(unwrapped_env, "configure_rendering"):
             unwrapped_env.configure_rendering(
@@ -137,15 +136,16 @@ class normalTrainer:
                 "inspect the initial-flow phase bank and flow state"
             )
         if not self.cfg.get("headless", False):
-            # Show the reset pose before the first physics substep.
+            # Show the reset pose before the first physics substep. Otherwise
+            # a fish that fails on its first action is never displayed at its
+            # actual spawn location.
             self.env.render()
 
         num_envs = self.env.num_envs
         completed_rounds = 0
         round_episodes = 0
-        round_successes = 0
         round_rewards = 0.0
-        success_rate = 0.0
+
         avg_reward = 0.0
         policy_steps = 0
         current_episode_rewards = torch.zeros(num_envs, device=self.device)
@@ -195,43 +195,39 @@ class normalTrainer:
 
                     current_episode_rewards += rewards.flatten()
 
-                    if hasattr(unwrapped_env, "reset_terminated"):
-                        success_mask = unwrapped_env.reset_terminated
-                    elif hasattr(self.env, "reset_terminated"):
-                        success_mask = self.env.reset_terminated
-                    else:
-                        success_mask = terminated
+                    done = (terminated | truncated).flatten()
+                    done_indices = torch.where(done)[0]
 
-                    done_indices = torch.where((terminated | truncated).flatten())[0]
-                    finished_rewards = current_episode_rewards[done_indices].tolist()
-                    finished_successes = success_mask.flatten()[done_indices].tolist()
+                    finished_rewards = (
+                        current_episode_rewards[done_indices].tolist()
+                    )
+
                     current_episode_rewards[done_indices] = 0.0
 
                     # Several environments may finish on the same vector step.
                     # Carry completed episodes past a round boundary into the
                     # next round, and keep unfinished returns in the buffer.
-                    for episode_reward, succeeded in zip(
-                        finished_rewards, finished_successes
-                    ):
+                    for episode_reward in finished_rewards:
+
                         round_episodes += 1
                         round_rewards += episode_reward
-                        round_successes += int(succeeded)
+
                         progress.update(1)
 
                         if round_episodes == num_eval_episodes:
                             completed_rounds += 1
-                            success_rate = round_successes / num_eval_episodes
-                            avg_reward = round_rewards / num_eval_episodes
+
+                            avg_reward = (
+                                round_rewards / num_eval_episodes
+                            )
+
                             progress.refresh()
                             logger.info(
                                 f"Evaluation round {completed_rounds}: "
                                 f"{num_eval_episodes} episodes | "
-                                f"success {success_rate * 100:.2f}% "
-                                f"({round_successes}/{num_eval_episodes}) | "
                                 f"average reward {avg_reward:.4f}"
                             )
                             round_episodes = 0
-                            round_successes = 0
                             round_rewards = 0.0
                             progress.reset(total=num_eval_episodes)
                             progress.set_description(
@@ -241,12 +237,9 @@ class normalTrainer:
                     observations = next_observations
                     states = next_states
 
-                    for agent in self.agents:
-                        agent.post_interaction(timestep=0, timesteps=1)
         except KeyboardInterrupt:
             logger.info(f"Evaluation stopped after {completed_rounds} full rounds")
         finally:
             progress.close()
 
-        return success_rate, avg_reward
-                
+        return avg_reward

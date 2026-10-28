@@ -189,18 +189,25 @@ class PPO:
             trainer_cfg = dataclasses.asdict(trainer_cfg)
         else:
             trainer_cfg = {k: v for k, v in trainer_cfg.__dict__.items() if not k.startswith('_')}
+
+        is_eval = trainer_cfg.get("mode") == "eval"
+        self.writer = None
         
-        # main entry to log data for consumption and visualization by TensorBoard
-        if self.write_interval == "auto":
-            self.write_interval = int(trainer_cfg.get("timesteps", 0) / 100)
-        if self.write_interval > 0:
-            self.writer = SummaryWriter(log_dir=self.experiment_dir)
-        
-        # checkpoint directory creation
-        if self.checkpoint_interval == "auto":
-            self.checkpoint_interval = int(trainer_cfg.get("timesteps", 0) / 10)
-        if self.checkpoint_interval > 0:
-            os.makedirs(os.path.join(self.experiment_dir, "checkpoints"), exist_ok=True)
+        if is_eval:
+            self.write_interval = 0
+            self.checkpoint_interval = 0
+        else:
+            # main entry to log data for consumption and visualization by TensorBoard
+            if self.write_interval == "auto":
+                self.write_interval = int(trainer_cfg.get("timesteps", 0) / 100)
+            if self.write_interval > 0:
+                self.writer = SummaryWriter(log_dir=self.experiment_dir)
+            
+            # checkpoint directory creation
+            if self.checkpoint_interval == "auto":
+                self.checkpoint_interval = int(trainer_cfg.get("timesteps", 0) / 10)
+            if self.checkpoint_interval > 0:
+                os.makedirs(os.path.join(self.experiment_dir, "checkpoints"), exist_ok=True)
         
         self.enable_models_training_mode(False)
 
