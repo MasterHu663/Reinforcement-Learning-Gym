@@ -89,9 +89,7 @@ class PPO:
         observation_space: gymnasium.Space | None = None,
         state_space: gymnasium.Space | None = None,
         action_space: gymnasium.Space | None = None,
-        device: str | torch.device,
-        checkpoint_geometry: dict[str, object] | None = None,
-        allow_legacy_horizontal_checkpoint: bool = False,
+        device: str | torch.device
     ) -> None:
 
         self.training = True # False
@@ -105,8 +103,6 @@ class PPO:
         self.device = torch.device(device) if isinstance(device, str) else device
 
         self.cfg = cfg
-        self.checkpoint_geometry = checkpoint_geometry
-        self.allow_legacy_horizontal_checkpoint = allow_legacy_horizontal_checkpoint
         
         # data tracking
         self.tracking_data = collections.defaultdict(list)
@@ -116,8 +112,6 @@ class PPO:
         self._track_timesteps = collections.deque(maxlen=100)
         self._cumulative_rewards = None
         self._cumulative_timesteps = None
-        self._stream_cumulative_rewards = {}
-        self._stream_cumulative_timesteps = {}
 
         # checkpoint
         self.checkpoint_modules = {}
@@ -146,23 +140,17 @@ class PPO:
         self.checkpoint_modules["value"] = self.value
         
         # set up optimizers and learning rate scheduler
-        if isinstance(self.cfg.learning_rate, tuple):
-            actor_lr, critic_lr = self.cfg.learning_rate
-            self.optimizer = torch.optim.Adam([
-                {"params": [p for p in self.policy.parameters() if p.requires_grad], "lr": actor_lr},
-                {"params": [p for p in self.value.parameters() if p.requires_grad], "lr": critic_lr},
-            ])
-        else:
-            trainable_parameters = (
-                parameter
-                for parameter in itertools.chain(
-                    self.policy.parameters(), self.value.parameters()
-                )
-                if parameter.requires_grad
+        lr=self.cfg.learning_rate if isinstance(self.cfg.learning_rate, float) else self.cfg.learning_rate[0]
+        trainable_parameters = (
+            parameter
+            for parameter in itertools.chain(
+                self.policy.parameters(), self.value.parameters()
             )
-            self.optimizer = torch.optim.Adam(trainable_parameters, lr=self.cfg.learning_rate)
+            if parameter.requires_grad
+        )
+        self.optimizer = torch.optim.Adam(trainable_parameters, lr=lr)
         self.checkpoint_modules["optimizer"] = self.optimizer
-        self.scheduler = None if self.cfg.reference_mode else KLAdaptiveLR(
+        self.scheduler = KLAdaptiveLR(
             self.optimizer,
             min_lr=self.cfg.min_learning_rate,
             max_lr=self.cfg.max_learning_rate,
@@ -228,10 +216,6 @@ class PPO:
             self.memory.create_tensor(name="values", size=1, dtype=torch.float32)
             self.memory.create_tensor(name="returns", size=1, dtype=torch.float32)
             self.memory.create_tensor(name="advantages", size=1, dtype=torch.float32)
-            if self.cfg.stream_rollouts:
-                if self.memory.num_envs != 1 or not self.cfg.reference_mode:
-                    raise ValueError("stream rollouts require one memory slot and reference PPO")
-                self.memory.create_tensor(name="stream_ids", size=1, dtype=torch.long)
 
             self._tensors_names = ["observations", "states", "actions", "log_prob", "values", "returns", "advantages"]
 
@@ -267,9 +251,6 @@ class PPO:
         if self.training:
             values, _ = self.value.act(inputs, role="value")
             self._current_values = self._value_preprocessor(values, inverse=True)
-            # Async hierarchical rollouts must retain the value/log-probability
-            # that belongs to each environment's independently timed action.
-            outputs["values"] = self._current_values
 
         return actions, outputs
 
@@ -287,38 +268,20 @@ class PPO:
         infos: Any,
         timestep: int,
         timesteps: int,
-        log_prob: torch.Tensor | None = None,
-        values: torch.Tensor | None = None,
-        stream_ids: torch.Tensor | None = None,
     ) -> None:
-
-        if self.cfg.stream_rollouts:
-            if stream_ids is None or tuple(stream_ids.shape) != (1, 1):
-                raise ValueError("stream rollouts require one stream id per transition")
-            stream_id = int(stream_ids[0, 0].item())
-            running_reward = self._stream_cumulative_rewards.get(stream_id, 0.0) + float(rewards[0, 0].item())
-            running_steps = self._stream_cumulative_timesteps.get(stream_id, 0) + 1
-            self._stream_cumulative_rewards[stream_id] = running_reward
-            self._stream_cumulative_timesteps[stream_id] = running_steps
-            if bool((terminated | truncated)[0, 0]):
-                self._track_rewards.append(running_reward)
-                self._track_timesteps.append(running_steps)
-                self._stream_cumulative_rewards[stream_id] = 0.0
-                self._stream_cumulative_timesteps[stream_id] = 0
         
         if self.write_interval > 0:
             # compute the cumulative sum of the rewards and timesteps
-            if not self.cfg.stream_rollouts and self._cumulative_rewards is None:
+            if self._cumulative_rewards is None:
                 self._cumulative_rewards = torch.zeros_like(rewards, dtype=torch.float32)
                 self._cumulative_timesteps = torch.zeros_like(rewards, dtype=torch.int32)
 
-            if not self.cfg.stream_rollouts:
-                self._cumulative_rewards.add_(rewards)
-                self._cumulative_timesteps.add_(1)
+            self._cumulative_rewards.add_(rewards)
+            self._cumulative_timesteps.add_(1)
 
             # check ended episodes
-            finished_episodes = (terminated | truncated).nonzero(as_tuple=True)[0]
-            if finished_episodes.numel() and not self.cfg.stream_rollouts:
+            finished_episodes = (terminated + truncated).nonzero(as_tuple=True)[0]
+            if finished_episodes.numel():
 
                 # storage cumulative rewards and timesteps
                 self._track_rewards.extend(self._cumulative_rewards[finished_episodes].tolist())
@@ -373,9 +336,8 @@ class PPO:
                 rewards=rewards,
                 terminated=terminated,
                 truncated=truncated,
-                log_prob=self._current_log_prob if log_prob is None else log_prob,
-                values=self._current_values if values is None else values,
-                **({"stream_ids": stream_ids} if self.cfg.stream_rollouts else {}),
+                log_prob=self._current_log_prob,
+                values=self._current_values,
             )
             
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
@@ -390,8 +352,7 @@ class PPO:
         
         if self.training:
             self._rollout += 1
-            if (self.cfg.auto_update and not self._rollout % self.cfg.rollouts
-                    and timestep >= self.cfg.learning_starts):
+            if not self._rollout % self.cfg.rollouts and timestep >= self.cfg.learning_starts:
                 self.enable_models_training_mode(True)
                 self.update(timestep=timestep, timesteps=timesteps)
                 self.enable_models_training_mode(False)
@@ -419,61 +380,31 @@ class PPO:
     def update(self, timestep: int, timesteps: int) -> None:
 
         # compute returns and advantages
-        valid_steps = self.memory.memory_size if self.memory.filled else self.memory.memory_index
-        if valid_steps < 1:
-            return
-        values = self.memory.get_tensor_by_name("values")[:valid_steps]
-        if self.cfg.reference_mode:
-            # Classic_PPO uses discounted Monte-Carlo returns with zero tail
-            # at each update; the vector form keeps independent environments
-            # separate while preserving the same return convention.
-            rewards = self.memory.get_tensor_by_name("rewards")[:valid_steps]
-            done = (
-                self.memory.get_tensor_by_name("terminated")[:valid_steps]
-                | self.memory.get_tensor_by_name("truncated")[:valid_steps]
-            )
-            returns = torch.empty_like(rewards)
-            if self.cfg.stream_rollouts:
-                stream_ids = self.memory.get_tensor_by_name("stream_ids")[:valid_steps, 0, 0].tolist()
-                tails = {}
-                for index in range(valid_steps - 1, -1, -1):
-                    stream_id = stream_ids[index]
-                    tail = tails.get(stream_id, torch.zeros_like(rewards[index]))
-                    tail = rewards[index] + self.cfg.discount_factor * tail * (~done[index])
-                    returns[index] = tail
-                    tails[stream_id] = tail
-            else:
-                discounted = torch.zeros_like(rewards[0])
-                for index in range(valid_steps - 1, -1, -1):
-                    discounted = rewards[index] + self.cfg.discount_factor * discounted * (~done[index])
-                    returns[index] = discounted
-            advantages = returns - values
-            spread = advantages.std() if advantages.numel() > 1 else advantages.std(unbiased=False)
-            advantages = (advantages - advantages.mean()) / (spread + 1e-7)
-        else:
-            with torch.no_grad():
-                inputs = {
-                    "observations": self._observation_preprocessor(self._current_next_observations),
-                    "states": self._state_preprocessor(self._current_next_states),
-                }
-                self.value.enable_training_mode(False)
-                last_values, _ = self.value.act(inputs, role="value")
-                self.value.enable_training_mode(True)
-                last_values = self._value_preprocessor(last_values, inverse=True)
-            returns, advantages = compute_gae(
-                rewards=self.memory.get_tensor_by_name("rewards")[:valid_steps],
-                terminated=self.memory.get_tensor_by_name("terminated")[:valid_steps],
-                truncated=self.memory.get_tensor_by_name("truncated")[:valid_steps],
-                values=values,
-                last_values=last_values,
-                discount_factor=self.cfg.discount_factor,
-                lambda_coefficient=self.cfg.gae_lambda,
-                time_limit_bootstrap=self.cfg.time_limit_bootstrap,
-            )
+        with torch.no_grad():
+            inputs = {
+                "observations": self._observation_preprocessor(self._current_next_observations),
+                "states": self._state_preprocessor(self._current_next_states),
+            }
+            self.value.enable_training_mode(False)
+            last_values, _ = self.value.act(inputs, role="value")
+            self.value.enable_training_mode(True)
+            last_values = self._value_preprocessor(last_values, inverse=True)
 
-        self.memory.get_tensor_by_name("values")[:valid_steps].copy_(self._value_preprocessor(values, train=True))
-        self.memory.get_tensor_by_name("returns")[:valid_steps].copy_(self._value_preprocessor(returns, train=True))
-        self.memory.get_tensor_by_name("advantages")[:valid_steps].copy_(advantages)
+        values = self.memory.get_tensor_by_name("values")
+        returns, advantages = compute_gae(
+            rewards=self.memory.get_tensor_by_name("rewards"),
+            terminated=self.memory.get_tensor_by_name("terminated"),
+            truncated=self.memory.get_tensor_by_name("truncated"),
+            values=values,
+            last_values=last_values,
+            discount_factor=self.cfg.discount_factor,
+            lambda_coefficient=self.cfg.gae_lambda,
+            time_limit_bootstrap=self.cfg.time_limit_bootstrap,
+        )
+
+        self.memory.set_tensor_by_name("values", self._value_preprocessor(values, train=True))
+        self.memory.set_tensor_by_name("returns", self._value_preprocessor(returns, train=True))
+        self.memory.set_tensor_by_name("advantages", advantages)
 
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
@@ -678,8 +609,6 @@ class PPO:
         # whole agent
         else:
             modules = {name: self._get_internal_value(module) for name, module in self.checkpoint_modules.items()}
-            if self.checkpoint_geometry is not None:
-                modules["geometry"] = self.checkpoint_geometry
             torch.save(modules, os.path.join(self.experiment_dir, "checkpoints", f"agent_{tag}.pt"))
 
         # best modules
@@ -694,8 +623,6 @@ class PPO:
             # whole agent
             else:
                 modules = {name: self.checkpoint_best_modules["modules"][name] for name in self.checkpoint_modules}
-                if self.checkpoint_geometry is not None:
-                    modules["geometry"] = self.checkpoint_geometry
                 torch.save(modules, os.path.join(self.experiment_dir, "checkpoints", "best_agent.pt"))
             self.checkpoint_best_modules["saved"] = True
             
@@ -705,11 +632,9 @@ class PPO:
         :param path: Path to save the agent to.
         """
         modules = {name: self._get_internal_value(module) for name, module in self.checkpoint_modules.items()}
-        if self.checkpoint_geometry is not None:
-            modules["geometry"] = self.checkpoint_geometry
         torch.save(modules, path)
 
-    def load(self, path: str, *, load_optimizer: bool = True) -> None:
+    def load(self, path: str) -> None:
         """Load the agent from the specified path.
 
         .. note::
@@ -717,25 +642,11 @@ class PPO:
             The final storage device is determined by the constructor of the agent.
 
         :param path: Path to load the agent from.
-        :param load_optimizer: Whether to restore the optimizer state. Evaluation
-            only needs policy/value weights; skipping optimizer state also allows
-            a frozen-policy checkpoint to be evaluated by an agent constructed
-            with a different set of trainable parameters.
         """
         modules = torch.load(path, map_location=self.device, weights_only=False)  # prevent torch:FutureWarning
-        if self.checkpoint_geometry is not None:
-            from environments.geometry_contract import validate_checkpoint_signature
-
-            validate_checkpoint_signature(
-                modules, self.checkpoint_geometry, path,
-                allow_legacy_horizontal=self.allow_legacy_horizontal_checkpoint,
-                warn_legacy=False,
-            )
 
         if type(modules) is dict:
             for name, data in modules.items():
-                if name == "optimizer" and not load_optimizer:
-                    continue
                 module = self.checkpoint_modules.get(name, None)
                 if module is not None:
                     if hasattr(module, "load_state_dict"):
