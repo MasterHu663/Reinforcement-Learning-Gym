@@ -51,6 +51,7 @@ class PPOConfig:
     entropy_loss_scale: float = 0.01
     value_loss_scale: float = 0.5
     kl_threshold: float = 0.02
+    # Bootstrap pure truncations from infos["final_observation"] before autoreset.
     time_limit_bootstrap: bool = False
     rewards_shaper: Callable | None = None
     mixed_precision: bool = False

@@ -6,33 +6,42 @@ from loguru import logger
 
 class normalTrainer:
     def __init__(self, env, agents, device: str | torch.device, cfg: dict):
-        
+
         self.env = env
-        
+
         if not isinstance(agents, (list, tuple)):
             self.agents = [agents]
         else:
             self.agents = agents
         self.scopes = [[0, self.env.num_envs]]
-            
+
         self.device = torch.device(device)
         self.num_envs = env.num_envs
         self.cfg = cfg
+
+    def _slice_infos(self, infos, scope):
+        """Keep batched tensor metadata aligned with an agent's environment rows."""
+        if isinstance(infos, dict):
+            return {key: self._slice_infos(value, scope) for key, value in infos.items()}
+        if isinstance(infos, torch.Tensor) and infos.ndim and infos.shape[0] == self.num_envs:
+            return infos[scope[0] : scope[1]]
+        return infos
 
     def train(self) -> None:
 
         trainer_cfg = dict(self.cfg)
         trainer_cfg["mode"] = "train"
-        
+
         # set running mode
         for agent in self.agents:
             agent.init(trainer_cfg=trainer_cfg)
             agent.enable_training_mode(True)
         unwrapped_env = getattr(self.env, "unwrapped", self.env)
         if hasattr(unwrapped_env, "configure_rendering"):
-            # Training is always render-free; visualization is an evaluation
-            # concern and must not slow down data collection.
-            unwrapped_env.configure_rendering(enabled=False)
+            unwrapped_env.configure_rendering(
+                enabled=not self.cfg.get("headless", False),
+                interval=self.cfg.get("render_interval", 1),
+            )
         # if self.num_simultaneous_agents > 1:
         #     for agent in self.agents:
         #         agent.enable_training_mode(False)
@@ -43,14 +52,14 @@ class normalTrainer:
         # if self.num_simultaneous_agents == 1:
         #     super().eval()
         #     return
-        
+
         # print(f"[Trainer] | num_envs: {self.num_envs}")
 
         observations, infos = self.env.reset()
         states = self.env.state()
-        
+
         for timestep in tqdm.tqdm(range(self.cfg["timesteps"]), disable=self.cfg["disable_progressbar"], file=sys.stdout):
-            
+
             # pre-interaction
             for agent in self.agents:
                 agent.pre_interaction(timestep=timestep, timesteps=self.cfg["timesteps"])
@@ -68,13 +77,15 @@ class normalTrainer:
                     _actions.append(actions)
                     _outputs.append(outputs)
                 actions = torch.vstack(_actions)
-                
+
                 # step the environments
                 next_observations, rewards, terminated, truncated, infos = self.env.step(actions)
                 next_states = self.env.state()
 
                 # record the environments' transitions
                 for agent, scope in zip(self.agents, self.scopes):
+                    agent_infos = infos if scope[0] == 0 and scope[1] == self.num_envs else self._slice_infos(infos, scope)
+
                     agent.record_transition(
                         observations=observations[scope[0] : scope[1]],
                         states=states[scope[0] : scope[1]] if states is not None else None,
@@ -84,7 +95,7 @@ class normalTrainer:
                         next_states=next_states[scope[0] : scope[1]] if next_states is not None else None,
                         terminated=terminated[scope[0] : scope[1]],
                         truncated=truncated[scope[0] : scope[1]],
-                        infos=infos,
+                        infos=agent_infos,
                         timestep=timestep,
                         timesteps=self.cfg["timesteps"],
                     )
@@ -106,7 +117,7 @@ class normalTrainer:
             # interaction, for both single- and multi-environment runs.
             observations = next_observations
             states = next_states
-                   
+
     def eval(self, num_eval_episodes=100):
 
         if num_eval_episodes < 1:
@@ -163,25 +174,20 @@ class normalTrainer:
                     for agent in self.agents:
                         agent.pre_interaction(timestep=0, timesteps=1)
 
-                    _actions = []
+                    _actions, _outputs = [], []
                     for agent, scope in zip(self.agents, self.scopes):
-                        try:
-                            actions, outputs = agent.act(
-                                observations[scope[0] : scope[1]],
-                                states[scope[0] : scope[1]] if states is not None else None,
-                                timestep=0,
-                                timesteps=1,
-                                deterministic=True,
-                            )
-                        except TypeError:
-                            actions, outputs = agent.act(
-                                observations[scope[0] : scope[1]],
-                                states[scope[0] : scope[1]] if states is not None else None,
-                                timestep=0,
-                                timesteps=1,
-                            )
-                        _actions.append(actions)
-
+                        actions, outputs = agent.act(
+                            observations[scope[0] : scope[1]],
+                            states[scope[0] : scope[1]] if states is not None else None,
+                            timestep=0,
+                            timesteps=1,
+                        )
+                        _actions.append(
+                            actions
+                            if self.cfg.get("stochastic_evaluation", False)
+                            else outputs.get("mean_actions", actions)
+                        )
+                        _outputs.append(outputs)
                     actions = torch.vstack(_actions)
 
                     # --- step environment ---

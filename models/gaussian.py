@@ -25,21 +25,6 @@ class GaussianMixin:
         role: str = "",
     ) -> None:
         """Gaussian mixin model (stochastic model).
-
-        :param clip_actions: Flag to indicate whether the actions should be clipped to the action space.
-        :param squash_actions: Apply a tanh transform and its log-probability
-            correction so sampled actions are naturally bounded to ``[-1, 1]``.
-        :param clip_mean_actions: Flag to indicate whether the mean actions should be clipped to the action space.
-            If ``True``, the mean actions will be clipped before sampling the actions.
-        :param clip_log_std: Flag to indicate whether the log standard deviations should be clipped.
-        :param min_log_std: Minimum value of the log standard deviation if ``clip_log_std`` is True.
-        :param max_log_std: Maximum value of the log standard deviation if ``clip_log_std`` is True.
-        :param reduction: Reduction method for returning the log probability density function.
-            If ``"none"``, the log probability density function is returned as a tensor of shape
-            ``(num_samples, num_actions)`` instead of ``(num_samples, 1)``.
-        :param role: Role played by the model.
-
-        :raises ValueError: If the reduction method is not valid.
         """
         self._g_clip_actions = clip_actions
         self._g_squash_actions = squash_actions
@@ -70,17 +55,6 @@ class GaussianMixin:
 
     def act(self, inputs: dict[str, Any], *, role: str = "") -> tuple[torch.Tensor, dict[str, Any]]:
         """Act stochastically in response to the observations/states of the environment.
-
-        :param inputs: Model inputs. The most common keys are:
-
-            - ``"observations"``: observation of the environment used to make the decision.
-            - ``"states"``: state of the environment used to make the decision.
-            - ``"taken_actions"``: actions taken by the policy for the given observations/states.
-        :param role: Role played by the model.
-
-        :return: Model output. The first component is the expected action/value returned by the model.
-            The second component is a dictionary containing the following extra output values:
-
             - ``"log_std"``: log of the standard deviation.
             - ``"log_prob"``: log of the probability density function.
             - ``"mean_actions"``: mean actions (network output after optional clipping).
@@ -135,6 +109,19 @@ class GaussianMixin:
         outputs["log_prob"] = log_prob
         outputs["mean_actions"] = deterministic_actions
         return actions, outputs
+
+    def random_act(self, inputs: dict[str, Any], *, role: str = "") -> tuple[torch.Tensor, dict[str, Any]]:
+        """Sample uniformly within finite action bounds during random warm-up."""
+        if self._g_min_actions is None or self._g_max_actions is None:
+            raise ValueError("Random actions require finite action-space bounds")
+        states = inputs.get("states")
+        if states is None:
+            states = inputs["observations"]
+        width = self._g_max_actions - self._g_min_actions
+        actions = torch.rand((*states.shape[:-1], *self.action_space.shape), device=self.device)
+        actions = self._g_min_actions + actions * width
+        log_prob = -width.log().sum().expand(*states.shape[:-1], 1)
+        return actions, {"log_prob": log_prob}
 
     def get_entropy(self, *, role: str = "") -> torch.Tensor:
         """Compute and return the entropy of the model.
