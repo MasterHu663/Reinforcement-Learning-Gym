@@ -215,7 +215,8 @@ class PPO:
         if self.memory is not None:
             self.memory.create_tensor(name="observations", size=self.observation_space, dtype=torch.float32)
             self.memory.create_tensor(name="states", size=self.state_space, dtype=torch.float32)
-            self.memory.create_tensor(name="actions", size=self.action_space, dtype=torch.float32)
+            action_dtype = torch.int64 if isinstance(self.action_space, gymnasium.spaces.Discrete) else torch.float32
+            self.memory.create_tensor(name="actions", size=self.action_space, dtype=action_dtype)
             self.memory.create_tensor(name="rewards", size=1, dtype=torch.float32)
             self.memory.create_tensor(name="terminated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
@@ -240,18 +241,16 @@ class PPO:
         
         inputs = {
             "observations": self._observation_preprocessor(observations),
-            "states": self._state_preprocessor(states),
+            "states": self._state_preprocessor(states if states is not None else observations),
+            "deterministic": deterministic,
         }
         
-        if timestep < self.cfg.random_timesteps:
-            return self.policy.random_act(inputs, role="policy")
-        
-        states = states.to(self.device)
-        
-        # sample stochastic actions
-        actions, outputs = self.policy.act(inputs, role="policy")
-        if deterministic:
-            actions = outputs["mean_actions"]
+        if not deterministic and timestep < self.cfg.random_timesteps:
+            actions, outputs = self.policy.random_act(inputs, role="policy")
+        else:
+            actions, outputs = self.policy.act(inputs, role="policy")
+            if deterministic:
+                actions = outputs["mean_actions"]
         self._current_log_prob = outputs["log_prob"]
 
         # compute values
@@ -323,17 +322,37 @@ class PPO:
             # if self.cfg.rewards_shaper is not None:
             #     rewards = self.cfg.rewards_shaper(rewards, timestep, timesteps)
 
-            # TODO time-limit (truncation) bootstrapping
-            if self.cfg.time_limit_bootstrap and truncated.any():
-                with torch.no_grad():
-                    inputs = {
-                        "observations": self._observation_preprocessor(next_observations),
-                        "states": self._state_preprocessor(next_states),
-                    }
-                    next_values, _ = self.value.act(inputs, role="value")
-                    next_values = self._value_preprocessor(next_values, inverse=True)
+            if self.cfg.time_limit_bootstrap:
+                time_outs = (truncated & ~terminated).reshape(-1)
+                if time_outs.any():
+                    final_observations = infos.get("final_observation")
+                    if final_observations is None:
+                        raise ValueError("Time-limit bootstrap requires infos['final_observation']")
+                    final_mask = infos.get("_final_observation")
+                    if final_mask is not None and (time_outs & ~final_mask.reshape(-1)).any():
+                        raise ValueError("Missing final observations for truncated environments")
 
-                rewards += self.cfg.discount_factor * next_values * truncated
+                    # The current environment shares policy/critic observations; separate final observations are also supported.
+                    if isinstance(final_observations, dict):
+                        final_states = final_observations.get("critic")
+                        final_observations = final_observations["policy"]
+                    else:
+                        final_states = final_observations
+                    if next_states is not None and final_states is None:
+                        raise ValueError("Time-limit bootstrap requires final critic observations")
+
+                    # Estimate values from final observations; next_* retains the environment outputs after autoreset.
+                    with torch.no_grad():
+                        inputs = {
+                            "observations": self._observation_preprocessor(final_observations[time_outs]),
+                            "states": self._state_preprocessor(final_states[time_outs]) if next_states is not None else None,
+                        }
+                        next_values, _ = self.value.act(inputs, role="value")
+                        next_values = self._value_preprocessor(next_values, inverse=True)
+
+                    # Keep environment rewards intact for logging and other consumers.
+                    rewards = rewards.clone()
+                    rewards[time_outs] += self.cfg.discount_factor * next_values
 
             # storage transition in memory
             self.memory.add_samples(
@@ -529,7 +548,11 @@ class PPO:
                 "Loss / Entropy loss", cumulative_entropy_loss / max(1, optimization_steps)
             )
 
-        self.track_data("Policy / Standard deviation", self.policy.distribution(role="policy").stddev.mean().item())
+        distribution = self.policy.distribution(role="policy")
+        if isinstance(distribution, torch.distributions.Categorical):
+            self.track_data("Policy / Entropy", self.policy.get_entropy(role="policy").mean().item())
+        else:
+            self.track_data("Policy / Standard deviation", distribution.stddev.mean().item())
 
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
@@ -664,5 +687,4 @@ class PPO:
                         raise NotImplementedError
                 else:
                     pass
-            
-    
+

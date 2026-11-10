@@ -136,6 +136,19 @@ class GaussianMixin:
         outputs["mean_actions"] = deterministic_actions
         return actions, outputs
 
+    def random_act(self, inputs: dict[str, Any], *, role: str = "") -> tuple[torch.Tensor, dict[str, Any]]:
+        """Sample uniformly within finite action bounds during random warm-up."""
+        if self._g_min_actions is None or self._g_max_actions is None:
+            raise ValueError("Random actions require finite action-space bounds")
+        states = inputs.get("states")
+        if states is None:
+            states = inputs["observations"]
+        width = self._g_max_actions - self._g_min_actions
+        actions = torch.rand((*states.shape[:-1], *self.action_space.shape), device=self.device)
+        actions = self._g_min_actions + actions * width
+        log_prob = -width.log().sum().expand(*states.shape[:-1], 1)
+        return actions, {"log_prob": log_prob}
+
     def get_entropy(self, *, role: str = "") -> torch.Tensor:
         """Compute and return the entropy of the model.
 

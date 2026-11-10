@@ -19,6 +19,9 @@ Run as a namespace package from the parent directory:
     actions = torch.randint(2, (env.num_envs,), device=env.device)
     obs, reward, terminated, truncated, info = env.step(actions)
     env.close()
+
+state: physical state (x, x_dot, theta, theta_dot) as a torch tensor 
+observation: {'policy': *, 'critic': *} as a torch tensor dict
 """
 
 from __future__ import annotations
@@ -40,11 +43,14 @@ class CartPoleEnv(gym.Env):
     All observations have shape ``(num_envs, 4)`` and are wrapped as
     ``{'policy': obs, 'critic': obs}``, matching the supplied FluidEnv.
     """
-
+    # Declare rendering capabilities for Gymnasium tools.
+    # The custom renderer does not use render_fps to limit its frame rate. 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
     is_vector_env = True
 
-    def __init__(self, cfg: CartPoleEnvConfig):
+    def __init__(
+            self, cfg: CartPoleEnvConfig
+        ):
         super().__init__()
         self.cfg = cfg
         self.num_envs = cfg.num_envs
@@ -67,6 +73,13 @@ class CartPoleEnv(gym.Env):
             cfg.x_threshold * 2.0, np.inf,
             cfg.theta_threshold_radians * 2.0, np.inf,
         ], dtype=np.float32)
+
+        '''1. Space
+        single_observation_space : {'policy': ..., 'critic': ...} space 
+                ->Wrapper get: tuple(observations='policy', states='critic')
+
+        action_space -> discrete or continuous
+        '''
         raw_space = gym.spaces.Box(-high, high, dtype=np.float32)
         self.single_observation_space = gym.spaces.Dict(policy=raw_space, critic=raw_space)
         self.single_state_space = raw_space
@@ -74,12 +87,15 @@ class CartPoleEnv(gym.Env):
         self.action_space = batch_space(self.single_action_space, self.num_envs)
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
         self.state_space = batch_space(self.single_state_space, self.num_envs)
-
+        
+        #Runtime return
         self.state_buf = torch.zeros((self.num_envs, 4), dtype=self._dtype, device=self.device)
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.reward_buf = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.reset_terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.reset_truncated = torch.zeros_like(self.reset_terminated)
+        
+        #Seed reset
         self._rng = torch.Generator(device=self.device)
         if cfg.seed is not None:
             self._rng.manual_seed(cfg.seed)
@@ -87,6 +103,7 @@ class CartPoleEnv(gym.Env):
         self._reset_low = cfg.reset_low
         self._reset_high = cfg.reset_high
         self._has_reset = False
+
         self._renderer = None
         self._render_during_step = False
         self._render_interval = 1
@@ -98,7 +115,10 @@ class CartPoleEnv(gym.Env):
         return self.state_buf
 
     def _reset_indices(self, ids: torch.Tensor) -> None:
-        """Reset only the selected parallel environments; keep others intact."""
+        """2. Reset
+        Reset only the selected parallel environments; 
+            [low, high] uniform -> state_buf[ids]
+        """
         ids = torch.as_tensor(ids, device=self.device, dtype=torch.long).reshape(-1)
         random_state = torch.rand(
             (ids.numel(), 4), generator=self._rng,
@@ -130,18 +150,25 @@ class CartPoleEnv(gym.Env):
             self.render()
         return self._pack_observation(), {}
 
+
+
+
+
     def _force_from_action(self, action: torch.Tensor | np.ndarray) -> torch.Tensor:
         action = torch.as_tensor(action, device=self.device)
         if self.cfg.action_mode == "discrete":
             if action.shape == (self.num_envs, 1):
                 action = action[:, 0]
+
+
+                
             if tuple(action.shape) != (self.num_envs,):
                 raise ValueError(
                     f"Expected discrete actions shape ({self.num_envs},), got {tuple(action.shape)}"
                 )
             if self.cfg.validate_actions and not bool(torch.all((action == 0) | (action == 1))):
                 raise ValueError("Discrete CartPole actions must be 0 or 1")
-            # Conventional values from a Discrete(2) policy are exactly 0/1.
+            # 0/1 to -force_mag/+force_mag
             return torch.where(
                 action == 1,
                 torch.full_like(action, self.cfg.force_mag, dtype=self._dtype),
@@ -183,12 +210,18 @@ class CartPoleEnv(gym.Env):
             next_x_dot = x_dot + c.tau * xacc
             next_theta = theta + c.tau * theta_dot
             next_theta_dot = theta_dot + c.tau * thetaacc
+            
         else:
             next_x_dot = x_dot + c.tau * xacc
             next_x = x + c.tau * next_x_dot
             next_theta_dot = theta_dot + c.tau * thetaacc
             next_theta = theta + c.tau * next_theta_dot
 
+        """3. torch.stack()
+        x.shape=(num_envs,) 
+        x,y,z,w -> torch.stack((x,y,z,w), dim=1) -> (num_envs, 4) 
+            -> state_buf
+        """
         self.state_buf.copy_(torch.stack((
             next_x, next_x_dot, next_theta, next_theta_dot,
         ), dim=1))
@@ -207,6 +240,18 @@ class CartPoleEnv(gym.Env):
         self.reset_truncated.copy_(truncated)
         done = terminated | truncated
         # Preserve pre-reset terminal states for logging/bootstrapping.
+        """4. time-limit truncated (bootstrapping)
+        PPO update:
+            time_limit_bootstrap=True 
+            |-> 
+            |    done=terminated|truncated-> next_obs=reset 
+            |         is not the next state!
+            |    solution: use the pre-reset next_state for bootstrapping, not the reset state.
+            time_limit_bootstrap=False 
+            |-> 
+            |   done=terminated : that is ok
+            |
+        """
         final_observation = self.state_buf.to(dtype=torch.float32).clone()
         final_episode_length = self.episode_length_buf.clone()
         reset_ids = torch.nonzero(done, as_tuple=True)[0]
