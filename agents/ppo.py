@@ -84,7 +84,7 @@ class PPO:
         self,
         *,
         cfg: PPOConfig,
-        models: dict[str, nn.Module], 
+        models: dict[str, nn.Module],
         memory: Memory,
         observation_space: gymnasium.Space | None = None,
         state_space: gymnasium.Space | None = None,
@@ -93,7 +93,7 @@ class PPO:
     ) -> None:
 
         self.training = True # False
-        
+
         self.models = models
         self.memory = memory
         self.observation_space = observation_space
@@ -101,9 +101,9 @@ class PPO:
         self.action_space = action_space
 
         self.device = torch.device(device) if isinstance(device, str) else device
-
+        self._device_type = self.device.type
         self.cfg = cfg
-        
+
         # data tracking
         self.tracking_data = collections.defaultdict(list)
         self.write_interval = self.cfg.experiment.write_interval
@@ -117,12 +117,12 @@ class PPO:
         self.checkpoint_modules = {}
         self.checkpoint_interval = self.cfg.experiment.checkpoint_interval
         self.checkpoint_best_modules = {"timestep": 0, "reward": -(2**31), "saved": False, "modules": {}}
-        
+
         # experiment directory
         directory = (
             self.cfg.experiment.directory if self.cfg.experiment.directory else os.path.join(os.getcwd(), "runs")
         )
-        
+
         # experiment directory
         experiment_name = (
             self.cfg.experiment.experiment_name
@@ -130,15 +130,15 @@ class PPO:
             else f"{datetime.datetime.now().strftime('%y-%m-%d_%H-%M-%S-%f')}_{self.__class__.__name__}"
         )
         self.experiment_dir = os.path.join(directory, experiment_name)
-        
+
         # models
         self.policy = self.models.get("policy", None)
         self.value = self.models.get("value", None)
-        
+
         # checkpoint models
         self.checkpoint_modules["policy"] = self.policy
         self.checkpoint_modules["value"] = self.value
-        
+
         # set up optimizers and learning rate scheduler
         lr=self.cfg.learning_rate if isinstance(self.cfg.learning_rate, float) else self.cfg.learning_rate[0]
         trainable_parameters = (
@@ -155,7 +155,7 @@ class PPO:
             min_lr=self.cfg.min_learning_rate,
             max_lr=self.cfg.max_learning_rate,
         )
-        
+
         # set up preprocessors
         # - observations
         if self.cfg.observation_preprocessor:
@@ -192,7 +192,7 @@ class PPO:
 
         is_eval = trainer_cfg.get("mode") == "eval"
         self.writer = None
-        
+
         if is_eval:
             self.write_interval = 0
             self.checkpoint_interval = 0
@@ -202,13 +202,13 @@ class PPO:
                 self.write_interval = int(trainer_cfg.get("timesteps", 0) / 100)
             if self.write_interval > 0:
                 self.writer = SummaryWriter(log_dir=self.experiment_dir)
-            
+
             # checkpoint directory creation
             if self.checkpoint_interval == "auto":
                 self.checkpoint_interval = int(trainer_cfg.get("timesteps", 0) / 10)
             if self.checkpoint_interval > 0:
                 os.makedirs(os.path.join(self.experiment_dir, "checkpoints"), exist_ok=True)
-        
+
         self.enable_models_training_mode(False)
 
         # create tensors in memory
@@ -232,32 +232,26 @@ class PPO:
         self._current_log_prob = None
         self._current_values = None
         self._rollout = 0
-               
+
     def act(
         self, observations: torch.Tensor, states: torch.Tensor | None, *, timestep: int, timesteps: int,
-        deterministic: bool = False,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        
+
         inputs = {
             "observations": self._observation_preprocessor(observations),
             "states": self._state_preprocessor(states),
         }
-        
-        if timestep < self.cfg.random_timesteps:
-            return self.policy.random_act(inputs, role="policy")
-        
-        states = states.to(self.device)
-        
-        # sample stochastic actions
-        actions, outputs = self.policy.act(inputs, role="policy")
-        if deterministic:
-            actions = outputs["mean_actions"]
-        self._current_log_prob = outputs["log_prob"]
 
-        # compute values
-        if self.training:
-            values, _ = self.value.act(inputs, role="value")
-            self._current_values = self._value_preprocessor(values, inverse=True)
+        # sample stochastic actions
+        # Mixed Precision
+        with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+            actions, outputs = self.policy.act(inputs, role="policy")
+            self._current_log_prob = outputs["log_prob"]
+
+            # compute values
+            if self.training:
+                values, _ = self.value.act(inputs, role="value")
+                self._current_values = self._value_preprocessor(values, inverse=True)
 
         return actions, outputs
 
@@ -276,7 +270,7 @@ class PPO:
         timestep: int,
         timesteps: int,
     ) -> None:
-        
+
         if self.write_interval > 0:
             # compute the cumulative sum of the rewards and timesteps
             if self._cumulative_rewards is None:
@@ -314,7 +308,7 @@ class PPO:
                 self.tracking_data["Episode / Total timesteps (max)"].append(np.max(track_timesteps))
                 self.tracking_data["Episode / Total timesteps (min)"].append(np.min(track_timesteps))
                 self.tracking_data["Episode / Total timesteps (mean)"].append(np.mean(track_timesteps))
-        
+
         if self.training:
             self._current_next_observations = next_observations
             self._current_next_states = next_states
@@ -323,17 +317,37 @@ class PPO:
             # if self.cfg.rewards_shaper is not None:
             #     rewards = self.cfg.rewards_shaper(rewards, timestep, timesteps)
 
-            # TODO time-limit (truncation) bootstrapping
-            if self.cfg.time_limit_bootstrap and truncated.any():
-                with torch.no_grad():
-                    inputs = {
-                        "observations": self._observation_preprocessor(next_observations),
-                        "states": self._state_preprocessor(next_states),
-                    }
-                    next_values, _ = self.value.act(inputs, role="value")
-                    next_values = self._value_preprocessor(next_values, inverse=True)
+            if self.cfg.time_limit_bootstrap:
+                time_outs = (truncated & ~terminated).reshape(-1)
+                if time_outs.any():
+                    final_observations = infos.get("final_observation")
+                    if final_observations is None:
+                        raise ValueError("Time-limit bootstrap requires infos['final_observation']")
+                    final_mask = infos.get("_final_observation")
+                    if final_mask is not None and (time_outs & ~final_mask.reshape(-1)).any():
+                        raise ValueError("Missing final observations for truncated environments")
 
-                rewards += self.cfg.discount_factor * next_values * truncated
+                    # The current environment shares policy/critic observations; separate final observations are also supported.
+                    if isinstance(final_observations, dict):
+                        final_states = final_observations.get("critic")
+                        final_observations = final_observations["policy"]
+                    else:
+                        final_states = final_observations
+                    if next_states is not None and final_states is None:
+                        raise ValueError("Time-limit bootstrap requires final critic observations")
+
+                    # Estimate values from final observations; next_* retains the environment outputs after autoreset.
+                    with torch.no_grad():
+                        inputs = {
+                            "observations": self._observation_preprocessor(final_observations[time_outs]),
+                            "states": self._state_preprocessor(final_states[time_outs]) if next_states is not None else None,
+                        }
+                        next_values, _ = self.value.act(inputs, role="value")
+                        next_values = self._value_preprocessor(next_values, inverse=True)
+
+                    # Keep environment rewards intact for logging and other consumers.
+                    rewards = rewards.clone()
+                    rewards[time_outs] += self.cfg.discount_factor * next_values
 
             # storage transition in memory
             self.memory.add_samples(
@@ -346,7 +360,7 @@ class PPO:
                 log_prob=self._current_log_prob,
                 values=self._current_values,
             )
-            
+
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         """Method called before the interaction with the environment.
 
@@ -354,16 +368,16 @@ class PPO:
         :param timesteps: Number of timesteps.
         """
         pass
-    
+
     def post_interaction(self, timestep: int, timesteps: int) -> None:
-        
+
         if self.training:
             self._rollout += 1
             if not self._rollout % self.cfg.rollouts and timestep >= self.cfg.learning_starts:
                 self.enable_models_training_mode(True)
                 self.update(timestep=timestep, timesteps=timesteps)
                 self.enable_models_training_mode(False)
-                
+
         timestep += 1
 
         # update best models and write checkpoints
@@ -488,7 +502,7 @@ class PPO:
 
                 # optimization step
                 self.optimizer.zero_grad()
-                
+
                 loss = policy_loss + entropy_loss + value_loss
                 loss.backward()
 
@@ -500,7 +514,7 @@ class PPO:
                         # global norm budget and suppress the policy update.
                         nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.grad_norm_clip)
                         nn.utils.clip_grad_norm_(self.value.parameters(), self.cfg.grad_norm_clip)
-                        
+
                 self.optimizer.step()
                 optimization_steps += 1
 
@@ -533,7 +547,7 @@ class PPO:
 
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
-            
+
     def _empty_preprocessor(self, _input: Any, *args, **kwargs) -> Any:
 
         return _input
@@ -541,7 +555,7 @@ class PPO:
     def _get_internal_value(self, _module: Any) -> Any:
 
         return _module.state_dict() if hasattr(_module, "state_dict") else _module
- 
+
     def enable_training_mode(self, enabled: bool = True, *, apply_to_models: bool = False) -> None:
         """Set the training mode of the agent: enabled (training) or disabled (evaluation).
 
@@ -632,7 +646,7 @@ class PPO:
                 modules = {name: self.checkpoint_best_modules["modules"][name] for name in self.checkpoint_modules}
                 torch.save(modules, os.path.join(self.experiment_dir, "checkpoints", "best_agent.pt"))
             self.checkpoint_best_modules["saved"] = True
-            
+
     def save(self, path: str) -> None:
         """Save the agent to the specified path.
 
@@ -664,5 +678,3 @@ class PPO:
                         raise NotImplementedError
                 else:
                     pass
-            
-    
